@@ -10,11 +10,11 @@ on:
       version_name:
         description: 'Version name Demo (mis. 1.0.0)'
         required: false
-        default: '1.0.2'
+        default: '1.0.3'
       version_code:
         description: 'Version code Demo (angka)'
         required: false
-        default: '3'
+        default: '4'
       website_url:
         description: 'URL website yang dibungkus WebView'
         required: false
@@ -26,7 +26,7 @@ on:
       release_tag:
         description: 'Tag GitHub Release Demo'
         required: false
-        default: 'demo-v1.0.2-manual'
+        default: 'demo-v1.0.3-manual'
 
 permissions:
   contents: write
