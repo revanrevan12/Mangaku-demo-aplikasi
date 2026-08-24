@@ -1,0 +1,448 @@
+name: Build APK Demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Nama aplikasi Demo'
+        required: false
+        default: 'MangaKu'
+      version_name:
+        description: 'Version name Demo (mis. 1.0.0)'
+        required: false
+        default: '1.0.1'
+      version_code:
+        description: 'Version code Demo (angka)'
+        required: false
+        default: '2'
+      website_url:
+        description: 'URL website yang dibungkus WebView'
+        required: false
+        default: ''
+      logo_url:
+        description: 'URL logo website (PNG) untuk app icon'
+        required: false
+        default: ''
+      release_tag:
+        description: 'Tag GitHub Release Demo'
+        required: false
+        default: 'demo-v1.0.1-manual'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-demo-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GRADLE_OPTS: >-
+    -Dorg.gradle.daemon=false
+    -Dorg.gradle.parallel=true
+    -Dorg.gradle.caching=true
+    -Dorg.gradle.configuration-cache=false
+    -Dfile.encoding=UTF-8
+  JAVA_TOOL_OPTIONS: -Xmx2048m
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github
+            apk-config-demo.json
+            apk-icon-demo.b64
+            release.keystore.b64
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare demo config
+        run: |
+          set -euo pipefail
+          # Demo keeps its own config/icon files (apk-config-demo.json /
+          # apk-icon-demo.b64) so it never overwrites the official Resmi
+          # files. gen-android.js reads the canonical names, so copy the
+          # Demo variants into place before generating the project.
+          cp apk-config-demo.json apk-config.json
+          if [ -f apk-icon-demo.b64 ]; then
+            cp apk-icon-demo.b64 apk-icon.b64
+          fi
+          echo "Demo config in place:"
+          cat apk-config.json
+
+      - name: Setup Node.js 22 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          check-latest: false
+
+      - name: Verify Node.js
+        run: |
+          set -euo pipefail
+          echo "node=$(node -v) npm=$(npm -v)"
+          MAJOR=$(node -p "process.versions.node.split('.')[0]")
+          if [ "$MAJOR" -lt 22 ]; then
+            echo "::error::Expected Node.js 22+, got $(node -v)"
+            exit 1
+          fi
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-34 build-tools;34.0.0 platform-tools'
+          log-accepted-android-sdk-licenses: false
+          accept-android-sdk-licenses: true
+
+      - name: Generate Android project
+        run: |
+          set -euo pipefail
+          node -v
+          test -f .github/scripts/gen-android.js
+          node .github/scripts/gen-android.js
+          echo "=== Generated app/build.gradle ==="
+          cat app/build.gradle
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          VERSION_NAME: ${{ github.event.inputs.version_name }}
+          VERSION_CODE: ${{ github.event.inputs.version_code }}
+          WEBSITE_URL: ${{ github.event.inputs.website_url }}
+          LOGO_URL: ${{ github.event.inputs.logo_url }}
+          FALLBACK_PACKAGE: 'com.mangareader.demo'
+
+      - name: Validate project
+        run: |
+          set -euo pipefail
+          test -f settings.gradle
+          test -f build.gradle
+          test -f app/build.gradle
+          test -f app/src/main/AndroidManifest.xml
+          test -f app/src/main/res/values/strings.xml
+          test -f app/src/main/res/values/themes.xml
+          test -f app/src/main/res/values/colors.xml
+          test -f app/src/main/res/layout/activity_main.xml
+
+          HAS_PNG=0
+          if ls app/src/main/res/mipmap-*/ic_launcher.png >/dev/null 2>&1; then
+            for f in app/src/main/res/mipmap-*/ic_launcher.png; do
+              [ -f "$f" ] || continue
+              SIG=$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')
+              if [ "$SIG" != "89504e47" ]; then
+                echo "::warning::Corrupt PNG launcher $f — removing"
+                rm -f "$f"
+              else
+                HAS_PNG=1
+                echo "OK launcher PNG: $f ($(wc -c < "$f") bytes)"
+              fi
+            done
+          fi
+
+          if [ "$HAS_PNG" = "1" ]; then
+            echo "Using @mipmap/ic_launcher (website logo)"
+            sed -i 's|android:icon="@drawable/ic_launcher"|android:icon="@mipmap/ic_launcher"|g' app/src/main/AndroidManifest.xml
+            sed -i 's|android:roundIcon="@drawable/ic_launcher"|android:roundIcon="@mipmap/ic_launcher"|g' app/src/main/AndroidManifest.xml
+            for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+              if [ ! -f "app/src/main/res/${d}/ic_launcher.png" ]; then
+                SRC=$(ls app/src/main/res/mipmap-*/ic_launcher.png 2>/dev/null | head -1 || true)
+                if [ -n "${SRC:-}" ]; then
+                  mkdir -p "app/src/main/res/${d}"
+                  cp "$SRC" "app/src/main/res/${d}/ic_launcher.png"
+                fi
+              fi
+            done
+          else
+            echo "No valid mipmap PNG — installing vector drawable fallback"
+            find app/src/main/res -type d -name 'mipmap-*' -exec rm -rf {} + 2>/dev/null || true
+            mkdir -p app/src/main/res/drawable
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="utf-8"?>' \
+              '<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">' \
+              '<path android:fillColor="#E23636" android:pathData="M0,0h108v108h-108z"/>' \
+              '<path android:fillColor="#FFFFFF" android:pathData="M30,30h48v48h-48z"/>' \
+              '</vector>' > app/src/main/res/drawable/ic_launcher.xml
+            sed -i 's|android:icon="@mipmap/ic_launcher"|android:icon="@drawable/ic_launcher"|g' app/src/main/AndroidManifest.xml
+            sed -i 's|android:roundIcon="@mipmap/ic_launcher"|android:roundIcon="@drawable/ic_launcher"|g' app/src/main/AndroidManifest.xml
+          fi
+
+          echo "=== Manifest icon ==="
+          grep -E 'icon|roundIcon' app/src/main/AndroidManifest.xml || true
+          echo "=== res tree ==="
+          find app/src/main/res -type f | sort
+          echo "=== Java sources ==="
+          find app/src/main/java -type f | sort
+          echo "Project OK"
+
+      - name: Install Gradle 8.2
+        run: |
+          set -euo pipefail
+          GRADLE_VER=8.2
+          curl -fsSL -o /tmp/gradle.zip \
+            "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip"
+          sudo unzip -q /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-${GRADLE_VER}/bin" >> "$GITHUB_PATH"
+          export PATH="/opt/gradle-${GRADLE_VER}/bin:$PATH"
+          gradle --version
+
+      - name: Prepare stable release keystore
+        run: |
+          set -euo pipefail
+          KS_B64=""
+          if [ -f release.keystore.b64 ]; then
+            KS_B64=release.keystore.b64
+          elif [ -f .github/release.keystore.b64 ]; then
+            KS_B64=.github/release.keystore.b64
+          fi
+          if [ -n "$KS_B64" ]; then
+            base64 -d "$KS_B64" > release.keystore
+            ls -la release.keystore
+            keytool -list -keystore release.keystore -storepass MangaKuRelease2024 -storetype PKCS12 | head -20 || true
+            echo "Stable release keystore ready"
+          else
+            echo "::warning::release.keystore.b64 missing — falling back to debug keystore (updates may fail)"
+            mkdir -p ~/.android
+            if [ ! -f ~/.android/debug.keystore ]; then
+              keytool -genkeypair -v \
+                -keystore ~/.android/debug.keystore \
+                -storepass android -alias androiddebugkey -keypass android \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+
+      - name: Build release APK
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "JAVA_HOME=${JAVA_HOME:-}"
+          java -version
+          gradle --version || true
+
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            echo "::error::ANDROID_HOME empty"
+            exit 1
+          fi
+          SDK_ESC=$(printf '%s' "$ANDROID_HOME" | sed 's/\\/\\\\/g')
+          echo "sdk.dir=${SDK_ESC}" > local.properties
+          cat local.properties
+          if [ -f release.keystore.b64 ] && [ ! -f release.keystore ]; then
+            base64 -d release.keystore.b64 > release.keystore
+          fi
+
+          gradle wrapper --gradle-version 8.2 --no-daemon
+          chmod +x gradlew
+          test -f gradle/wrapper/gradle-wrapper.jar
+          test -f gradle/wrapper/gradle-wrapper.properties
+
+          {
+            echo 'org.gradle.caching=true'
+            echo 'org.gradle.configuration-cache=false'
+            echo 'org.gradle.daemon=false'
+            echo 'org.gradle.parallel=true'
+            echo 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=512m'
+            echo 'android.useAndroidX=true'
+            echo 'android.nonTransitiveRClass=true'
+          } > gradle.properties
+
+          dump_errors() {
+            local logf="$1"
+            echo "======== GRADLE ERROR SUMMARY ========"
+            grep -nE 'FAILURE:|What went wrong:|Execution failed|error:|AAPT|Caused by:|Could not |Task :.* FAILED|> ' \
+              "$logf" | tail -n 80 || true
+            echo "======== LAST 80 LINES ========"
+            tail -n 80 "$logf" || true
+            grep -E 'What went wrong:|Execution failed for task|error:|AAPT2? aapt2' "$logf" \
+              | head -n 15 \
+              | while IFS= read -r line; do
+                  echo "::error::${line}"
+                done || true
+          }
+
+          build_once() {
+            local label="$1"
+            shift
+            echo "=== Gradle build: ${label} ==="
+            set +e
+            ./gradlew "$@" \
+              --no-daemon \
+              --stacktrace \
+              --console=plain \
+              2>&1 | tee "/tmp/gradle-${label}.log"
+            local rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              dump_errors "/tmp/gradle-${label}.log"
+            fi
+            return "$rc"
+          }
+
+          if ! build_once first assembleRelease; then
+            echo '--- First build failed; clean retry (preserve launcher icon) ---'
+            ./gradlew --stop || true
+            rm -rf app/build .gradle build
+
+            KEEP_PNG=0
+            if ls app/src/main/res/mipmap-*/ic_launcher.png >/dev/null 2>&1; then
+              for f in app/src/main/res/mipmap-*/ic_launcher.png; do
+                SIG=$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n' || true)
+                if [ "$SIG" = "89504e47" ]; then KEEP_PNG=1; break; fi
+              done
+            fi
+            if [ "$KEEP_PNG" != "1" ]; then
+              echo 'No valid PNG launcher — vector fallback for retry'
+              rm -f app/src/main/res/mipmap-*/ic_launcher.png 2>/dev/null || true
+              mkdir -p app/src/main/res/drawable
+              printf '%s\n' \
+                '<?xml version="1.0" encoding="utf-8"?>' \
+                '<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">' \
+                '<path android:fillColor="#E23636" android:pathData="M0,0h108v108h-108z"/>' \
+                '<path android:fillColor="#FFFFFF" android:pathData="M30,30h48v48h-48z"/>' \
+                '</vector>' > app/src/main/res/drawable/ic_launcher.xml
+              sed -i 's|@mipmap/ic_launcher|@drawable/ic_launcher|g' app/src/main/AndroidManifest.xml
+            else
+              echo 'Keeping website logo PNG launchers for retry'
+              sed -i 's|android:icon="@drawable/ic_launcher"|android:icon="@mipmap/ic_launcher"|g' app/src/main/AndroidManifest.xml || true
+              sed -i 's|android:roundIcon="@drawable/ic_launcher"|android:roundIcon="@mipmap/ic_launcher"|g' app/src/main/AndroidManifest.xml || true
+            fi
+
+            if [ ! -f ~/.android/debug.keystore ]; then
+              keytool -genkeypair -keystore ~/.android/debug.keystore \
+                -storepass android -alias androiddebugkey -keypass android \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+
+            if ! build_once retry clean assembleRelease; then
+              echo "::error::assembleRelease failed after clean retry"
+              if [ -f /tmp/gradle-retry.log ]; then
+                echo "======== FULL FAILURE BLOCK ========"
+                awk '/FAILURE:/{p=1} p{print} /BUILD FAILED/{exit}' /tmp/gradle-retry.log || true
+              fi
+              exit 1
+            fi
+          fi
+
+          ls -la app/build/outputs/apk/release/ || {
+            echo "::error::Release APK missing"
+            find app/build -name '*.apk' 2>/dev/null || true
+            exit 1
+          }
+          echo "APK build OK"
+          find app/build/outputs/apk -name '*.apk' -ls
+
+      - name: Sign & package APK
+        id: sign
+        run: |
+          set -euo pipefail
+          APK=$(find . -path '*/outputs/apk/release/*.apk' ! -name '*.apk.idsig' | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan"
+            find . -name '*.apk' 2>/dev/null || true
+            exit 1
+          fi
+
+          SIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -1)
+          if [ -z "$SIGNER" ] || [ ! -x "$SIGNER" ]; then
+            echo "::error::apksigner tidak ditemukan di build-tools"
+            exit 1
+          fi
+
+          KS_FILE=""
+          KS_PASS=""
+          KS_ALIAS=""
+          KEY_PASS=""
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > /tmp/release.ks
+            KS_FILE=/tmp/release.ks
+            KS_PASS="${{ secrets.KEYSTORE_PASSWORD }}"
+            KS_ALIAS="${{ secrets.KEY_ALIAS }}"
+            KEY_PASS="${{ secrets.KEY_PASSWORD }}"
+            echo "Using KEYSTORE_BASE64 secret"
+          elif [ -f release.keystore ]; then
+            KS_FILE=release.keystore
+            KS_PASS="MangaKuRelease2024"
+            KS_ALIAS="manga-key"
+            KEY_PASS="MangaKuRelease2024"
+            echo "Using committed stable release.keystore"
+          elif [ -f release.keystore.b64 ]; then
+            base64 -d release.keystore.b64 > /tmp/release.ks
+            KS_FILE=/tmp/release.ks
+            KS_PASS="MangaKuRelease2024"
+            KS_ALIAS="manga-key"
+            KEY_PASS="MangaKuRelease2024"
+            echo "Using release.keystore.b64"
+          fi
+
+          if [ -n "$KS_FILE" ]; then
+            "$SIGNER" sign \
+              --ks "$KS_FILE" \
+              --ks-pass "pass:${KS_PASS}" \
+              --ks-key-alias "$KS_ALIAS" \
+              --key-pass "pass:${KEY_PASS}" \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --out /tmp/signed-release.apk \
+              "$APK"
+            mv /tmp/signed-release.apk "$APK"
+            echo "APK signed with stable keystore (alias=${KS_ALIAS})"
+          else
+            echo "::warning::No release keystore — keeping Gradle debug signature (updates may fail)"
+          fi
+
+          SIZE=$(stat -c%s "$APK" 2>/dev/null || stat -f%z "$APK")
+          echo "APK size bytes=${SIZE}"
+          if [ "${SIZE}" -lt 50000 ]; then
+            echo "::error::APK terlalu kecil (${SIZE} B) — kemungkinan corrupt"
+            exit 1
+          fi
+          MAGIC=$(head -c 4 "$APK" | od -An -tx1 | tr -d ' \n')
+          echo "APK magic=${MAGIC}"
+          if [ "$MAGIC" != "504b0304" ] && [ "$MAGIC" != "504b0506" ] && [ "$MAGIC" != "504b0708" ]; then
+            echo "::error::APK bukan ZIP valid (magic ${MAGIC}) — file corrupt"
+            exit 1
+          fi
+          if ! "$SIGNER" verify --verbose "$APK" 2>&1 | tee /tmp/apk-verify.log; then
+            echo "::error::apksigner verify gagal — APK tidak bisa di-install"
+            cat /tmp/apk-verify.log || true
+            exit 1
+          fi
+          if ! grep -qiE 'Verified using v[123] scheme|verifies' /tmp/apk-verify.log; then
+            echo "::warning::apksigner verify output unexpected — check log"
+            cat /tmp/apk-verify.log || true
+          fi
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -l "$APK" | head -40
+            unzip -l "$APK" | grep -q 'AndroidManifest.xml' || {
+              echo "::error::AndroidManifest.xml hilang di dalam APK"
+              exit 1
+            }
+          fi
+
+          # Fixed Demo filename — distinct from the official mangaku.apk so
+          # Android never treats them as the same package file.
+          SIGNED_APK="mangaku-demo.apk"
+          cp "$APK" "$SIGNED_APK"
+          ls -la "$SIGNED_APK"
+          file "$SIGNED_APK" || true
+          echo "apk_path=$SIGNED_APK" >> "$GITHUB_OUTPUT"
+          echo "apk_size=${SIZE}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release and upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: ${{ github.event.inputs.app_name }} Demo v${{ github.event.inputs.version_name }}
+          files: ${{ steps.sign.outputs.apk_path }}
+          generate_release_notes: false
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
